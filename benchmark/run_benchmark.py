@@ -6,10 +6,22 @@ import time
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
+import matplotlib.font_manager as fm
 from pathlib import Path
 
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+
+# Japanese font setup — use IPAexGothic bundled with japanize_matplotlib if available
+_jp_font_candidates = [
+    Path(sys.prefix) / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages" / "japanize_matplotlib" / "fonts" / "ipaexg.ttf",
+    Path(__file__).parent.parent / "ipaexg.ttf",
+]
+for _fp in _jp_font_candidates:
+    if _fp.exists():
+        fm.fontManager.addfont(str(_fp))
+        plt.rcParams["font.family"] = fm.FontProperties(fname=str(_fp)).get_name()
+        break
 
 from nbody_graph.utils.core import make_random_particles, G, SOFTENING
 from nbody_graph.methods.direct          import compute_acceleration_direct
@@ -227,6 +239,6 @@ if __name__ == "__main__":
     print("\n[2/2] スケーリング比較...")
     scaling = run_scaling_benchmark([50, 100, 200, 300, 500])
 
-    out = "/mnt/user-data/outputs/benchmark_results.png"
+    out = str(Path(__file__).parent.parent / "benchmark_results.png")
     plot_results(single, scaling, out_path=out)
     print("\n完了!")
