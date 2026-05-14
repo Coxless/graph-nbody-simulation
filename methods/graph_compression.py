@@ -1,105 +1,64 @@
 """
 グラフ圧縮法による N 体問題の近似加速度計算
 
-圧縮アルゴリズム一覧
---------------------
-1. compress_graph_threshold   — 閾値圧縮（決定論的、ベースライン）
-2. compress_graph_importance  — 重み比例サンプリング（確率的、不偏推定）
-3. compress_graph_spectral    — スペクトルスパース化（有効抵抗ベース）
+グラフ構築:
+  scipy.spatial.KDTree で k 近傍のみエッジ化 → O(N log N + N·k)
 
-設計メモ: threshold は「エッジを落として正確な力を計算」する偏った推定。
-importance と spectral は「採択エッジの重みを 1/p でスケーリング」することで
-E[w̃_e] = w_e を保ち、不偏推定量を得る。
+圧縮アルゴリズム:
+  スペクトルスパース化（Spielman-Srivastava 型）— 有効抵抗ベースのサンプリング
 """
 
 import numpy as np
 from scipy.linalg import eigh
+from scipy.spatial import KDTree
 from ..utils.core import Particles, G, SOFTENING
 
 
 # ─────────────────────────────────────────────────────────────
-# Step 1: 相互作用グラフの構築
+# Step 1: スパース相互作用グラフの構築（kd-tree k近傍）
 # ─────────────────────────────────────────────────────────────
 
-def build_interaction_graph(p: Particles, cutoff: float = None):
+def build_sparse_interaction_graph(p: Particles, k_neighbors: int = 32):
     """
-    粒子間の相互作用グラフを構築する。
+    kd-tree を使って k 近傍グラフを構築する。O(N log N + N·k)
+
+    全粒子ペア O(N²/2) ではなく各粒子の上位 k 近傍のみをエッジ化する。
+    双方向の近傍関係を考慮し、undirected edge (i < j) として重複なく返す。
+
+    Parameters
+    ----------
+    p           : Particles
+    k_neighbors : 各粒子あたりの近傍数（N-1 でクリップ）
 
     Returns
     -------
-    ii, jj : ndarray of int, shape (E,)
-    weights : ndarray of float, shape (E,)  — G * m_i * m_j / r²
+    ii, jj   : ndarray of int, shape (E,)   — E ≦ N·k
+    weights  : ndarray of float, shape (E,) — G * m_i * m_j / r²
     """
-    ii, jj = np.triu_indices(p.N, k=1)
+    k = min(k_neighbors, p.N - 1)
+    tree = KDTree(p.pos)
+    dists, idxs = tree.query(p.pos, k=k + 1)   # index 0 は自身（距離 0）
+
+    src = np.repeat(np.arange(p.N), k)
+    dst = idxs[:, 1:].ravel()                   # 自身を除いた k 近傍
+
+    # undirected pair (i < j) に統一 → 重複除去
+    ii_raw = np.minimum(src, dst)
+    jj_raw = np.maximum(src, dst)
+    pairs = np.unique(np.stack([ii_raw, jj_raw], axis=1), axis=0)
+    ii, jj = pairs[:, 0], pairs[:, 1]
 
     dr    = p.pos[jj] - p.pos[ii]
-    dist2 = np.sum(dr**2, axis=1) + SOFTENING**2   # 力計算と同じソフトニング
-    dist  = np.sqrt(dist2)
-
-    if cutoff is not None:
-        mask = dist < cutoff
-        ii, jj, dist = ii[mask], jj[mask], dist[mask]
-
-    weights = G * p.mass[ii] * p.mass[jj] / dist**2
+    dist2 = np.sum(dr**2, axis=1) + SOFTENING**2
+    weights = G * p.mass[ii] * p.mass[jj] / dist2
     return ii, jj, weights
 
 
 # ─────────────────────────────────────────────────────────────
-# Step 2a: 閾値圧縮（ベースライン）
+# Step 2: スペクトルスパース化（Spielman-Srivastava 型）
 # ─────────────────────────────────────────────────────────────
 
-def compress_graph_threshold(ii, jj, weights, keep_ratio: float = 0.5):
-    """
-    重み上位 keep_ratio のエッジのみ残す決定論的圧縮。
-
-    推定の性質: 偏り有り（弱い相互作用を系統的に脱落させる）。
-    速度: O(E log E)（ソート相当）。
-    """
-    if len(weights) == 0:
-        return ii, jj, weights
-    threshold = np.quantile(weights, 1 - keep_ratio)
-    mask = weights >= threshold
-    return ii[mask], jj[mask], weights[mask]
-
-
-# ─────────────────────────────────────────────────────────────
-# Step 2b: 重み比例サンプリング（不偏推定）
-# ─────────────────────────────────────────────────────────────
-
-def compress_graph_importance(
-    ii, jj, weights, keep_ratio: float = 0.5, seed=None
-):
-    """
-    重み比例確率サンプリング＋リスケーリング（不偏推定量）
-
-    各エッジ e をサンプリング確率 p_e = min(1, n_keep · w_e / Σw) で採択し、
-    採択された重みを w̃_e = w_e / p_e にスケーリングする。
-    このとき E[w̃_e] = w_e が保証され、どの粒子への合力も不偏に推定できる。
-
-    推定の性質: 不偏（期待値 = 真値）。
-    速度: O(E)。
-    """
-    if len(weights) == 0 or keep_ratio >= 1.0:
-        return ii, jj, weights.copy()
-    rng = np.random.default_rng(seed)
-
-    n_keep = max(1, int(len(weights) * keep_ratio))
-    p = np.minimum(1.0, n_keep * weights / weights.sum())
-
-    mask = rng.uniform(size=len(weights)) < p
-    if not mask.any():
-        mask[np.argmax(weights)] = True
-
-    return ii[mask], jj[mask], weights[mask] / p[mask]
-
-
-# ─────────────────────────────────────────────────────────────
-# Step 2c: スペクトルスパース化（Spielman-Srivastava 型）
-# ─────────────────────────────────────────────────────────────
-
-def compress_graph_spectral(
-    ii, jj, weights, keep_ratio: float = 0.5, seed=None
-):
+def compress_graph_spectral(ii, jj, weights, keep_ratio: float = 0.5, seed=None):
     """
     有効抵抗に基づくスペクトルスパース化。
 
@@ -112,7 +71,7 @@ def compress_graph_spectral(
     - keep_ratio = (n−1)/E のとき、スパニングツリー構造が必ず残る
     - 採択後の重みスケーリングで不偏推定を維持
 
-    計算コスト: O(N³)（密行列の固有分解）。N ≲ 1000 なら実用範囲。
+    計算コスト: O(N³)（密行列の固有分解）。スパースグラフ後でも N が律速。
     """
     if len(weights) == 0 or keep_ratio >= 1.0:
         return ii, jj, weights.copy()
@@ -128,22 +87,27 @@ def compress_graph_spectral(
     L[ii, jj] -= weights
     L[jj, ii] -= weights
 
-    # 固有分解 L = U Λ Uᵀ（対称行列なので eigh が使える）
+    # 固有分解 L = U Λ Uᵀ
     eigvals, U = eigh(L)
     tol = eigvals[-1] * 1e-10
     nonzero = eigvals > tol
 
     # V[i, :] ≡ (Λ^{1/2+} Uᵀ)[:, i]  →  R_ij = ‖V[i] − V[j]‖²
     sqrt_inv = np.where(nonzero, 1.0 / np.sqrt(np.maximum(eigvals, tol)), 0.0)
-    V = U * sqrt_inv[None, :]            # (N, N)
+    V = U * sqrt_inv[None, :]
 
-    diff_V = V[ii] - V[jj]              # (E, N)
-    R = np.sum(diff_V**2, axis=1)        # (E,)  有効抵抗
+    diff_V = V[ii] - V[jj]
+    R = np.sum(diff_V**2, axis=1)
 
-    leverage = weights * R               # l_e = w_e · R_e
+    leverage = weights * R
     l_sum = leverage.sum()
     if l_sum < 1e-30:
-        return compress_graph_threshold(ii, jj, weights, keep_ratio)
+        # レバレッジスコアが縮退した場合は一様サンプリングにフォールバック
+        rng2 = np.random.default_rng(seed)
+        idx = rng2.choice(len(weights), size=n_keep, replace=False)
+        mask = np.zeros(len(weights), dtype=bool)
+        mask[idx] = True
+        return ii[mask], jj[mask], weights[mask]
 
     p = np.minimum(1.0, n_keep * leverage / l_sum)
     mask = rng.uniform(size=len(weights)) < p
@@ -160,38 +124,24 @@ def compress_graph_spectral(
 def compute_acceleration_graph(
     p: Particles,
     keep_ratio: float = 0.5,
-    cutoff: float = None,
-    method: str = "threshold",
+    k_neighbors: int = 32,
 ) -> tuple:
     """
-    グラフ圧縮法による加速度計算。
+    スペクトルスパースグラフによる加速度計算。
 
     Parameters
     ----------
-    keep_ratio : float
-        保持するエッジの割合（1.0 = 直接法と同等）
-    cutoff : float or None
-        相互作用の距離カットオフ
-    method : {"threshold", "importance", "spectral"}
-        圧縮アルゴリズムの選択
+    keep_ratio  : スペクトル圧縮後に保持するエッジの割合
+    k_neighbors : kd-tree で構築する近傍数
 
     Returns
     -------
     acc          : ndarray (N, 3)
     n_kept_edges : int
-    n_total_edges: int
+    n_total_edges: int  — スパースグラフのエッジ数
     """
-    ii_all, jj_all, w_all = build_interaction_graph(p, cutoff=cutoff)
-
-    if method == "importance":
-        ii, jj, w = compress_graph_importance(ii_all, jj_all, w_all, keep_ratio)
-        rescaled = True
-    elif method == "spectral":
-        ii, jj, w = compress_graph_spectral(ii_all, jj_all, w_all, keep_ratio)
-        rescaled = True
-    else:  # threshold（デフォルト・後方互換）
-        ii, jj, _ = compress_graph_threshold(ii_all, jj_all, w_all, keep_ratio)
-        rescaled = False
+    ii_all, jj_all, w_all = build_sparse_interaction_graph(p, k_neighbors)
+    ii, jj, w = compress_graph_spectral(ii_all, jj_all, w_all, keep_ratio)
 
     acc = np.zeros((p.N, 3))
     if len(ii) > 0:
@@ -199,17 +149,9 @@ def compute_acceleration_graph(
         dist2 = np.sum(dr**2, axis=1) + SOFTENING**2
         dist  = np.sqrt(dist2)
 
-        if rescaled:
-            # w̃ = G·m_i·m_j/r² · (1/p_e)
-            # 粒子 i の加速度寄与: a_ij = w̃ / (m_i · r) · dr
-            # 不偏性: E[a_ij] = (p·w/p) / (m_i·r) · dr = G·m_j/r³ · dr ✓
-            f_ij = dr * (w / (p.mass[ii] * dist))[:, None]
-            f_ji = dr * (w / (p.mass[jj] * dist))[:, None]
-        else:
-            # 閾値法: 採択エッジに正確な力を使う（偏りあり）
-            scale = G / (dist2 * dist)
-            f_ij = dr * (p.mass[jj] * scale)[:, None]
-            f_ji = dr * (p.mass[ii] * scale)[:, None]
+        # w̃ = G·m_i·m_j/r² · (1/p_e)  — 不偏推定
+        f_ij = dr * (w / (p.mass[ii] * dist))[:, None]
+        f_ji = dr * (w / (p.mass[jj] * dist))[:, None]
 
         np.add.at(acc, ii,  f_ij)
         np.add.at(acc, jj, -f_ji)
@@ -217,14 +159,14 @@ def compute_acceleration_graph(
     return acc, len(ii), len(ii_all)
 
 
-def graph_compression_stats(p: Particles, keep_ratio: float = 0.5):
-    """圧縮率・保持エッジ数などの統計を返す"""
-    ii_all, jj_all, w_all = build_interaction_graph(p)
-    ii, _, _ = compress_graph_threshold(ii_all, jj_all, w_all, keep_ratio)
+def graph_compression_stats(p: Particles, keep_ratio: float = 0.5, k_neighbors: int = 32):
+    """スパースグラフの圧縮率・保持エッジ数などの統計を返す"""
+    ii_all, jj_all, w_all = build_sparse_interaction_graph(p, k_neighbors)
+    ii, jj, _ = compress_graph_spectral(ii_all, jj_all, w_all, keep_ratio)
     total = len(ii_all)
     kept  = len(ii)
     return {
         "total_edges": total,
-        "kept_edges": kept,
+        "kept_edges":  kept,
         "compression_ratio": kept / total if total > 0 else 1.0,
     }

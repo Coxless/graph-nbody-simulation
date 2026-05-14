@@ -1,210 +1,158 @@
 """
-Barnes-Hut法 O(N log N) — 八分木（Octree）による遠方粒子の質量中心近似
+Barnes-Hut法 O(N log N) — フラット八分木 + ベクトル化BFS
 """
+
+from collections import deque
 
 import numpy as np
 from ..utils.core import Particles, G, SOFTENING
 
-
-class OctreeNode:
-    """八分木の1ノード。葉ノードは1粒子、内部ノードは質量中心を保持。"""
-
-    __slots__ = (
-        "center", "half", "mass", "com", "idx",
-        "children", "is_leaf",
-    )
-
-    def __init__(self, center: np.ndarray, half: float):
-        self.center   = center      # このノードのAABBの中心
-        self.half     = half        # 半辺長
-        self.mass     = 0.0
-        self.com      = np.zeros(3) # 質量中心
-        self.idx      = -1          # 葉ノードの粒子インデックス
-        self.children = [None] * 8  # 8つの子ノード
-        self.is_leaf  = True
-
-    def _child_idx(self, pos: np.ndarray) -> int:
-        """どの八分体に属するかを3ビットで決定"""
-        bit = (pos > self.center).astype(int)
-        return bit[0] * 4 + bit[1] * 2 + bit[2]
-
-    def _child_center(self, octant: int) -> np.ndarray:
-        q = self.half / 2
-        offsets = np.array([
-            ((octant >> 2) & 1) * 2 - 1,
-            ((octant >> 1) & 1) * 2 - 1,
-            ((octant >> 0) & 1) * 2 - 1,
-        ], dtype=float)
-        return self.center + offsets * q
-
-    def insert(self, pos: np.ndarray, mass: float, idx: int):
-        """粒子を木に挿入し、質量・質量中心を更新"""
-        self.com = (self.com * self.mass + pos * mass) / (self.mass + mass)
-        self.mass += mass
-
-        if self.is_leaf:
-            if self.idx == -1:
-                # 空の葉 → 直接格納
-                self.idx = idx
-                return
-            # 既存粒子と衝突 → 分割して内部ノード化
-            self.is_leaf = False
-            old_idx = self.idx
-            self.idx = -1
-            # 既存粒子を子ノードへ再挿入（後で再帰するので再計算は不要）
-            self._insert_to_child(pos - (pos - self.center),  # dummy
-                                   old_idx, mass=0.0)           # massは既反映
-            # ここでは old_pos が必要なので、別途管理が必要
-            # → シンプル実装のため _insert_to_child はスキップし、
-            #    build() 時に順番に insert する設計を採用
-            # (実用上は pos リストを保持する実装が多い)
-            return
-
-        oi = self._child_idx(pos)
-        if self.children[oi] is None:
-            self.children[oi] = OctreeNode(
-                self._child_center(oi), self.half / 2
-            )
-        self.children[oi].insert(pos, mass, idx)
-
-    def calc_acc(
-        self,
-        pos: np.ndarray,
-        theta: float,
-        particle_pos: np.ndarray,
-        particle_mass: np.ndarray,
-    ) -> np.ndarray:
-        """
-        Barnes-Hut 基準で加速度を計算。
-        theta: 開き角（小さいほど精度高・速度低）
-        """
-        if self.mass == 0.0:
-            return np.zeros(3)
-
-        dr = self.com - pos
-        dist2 = np.dot(dr, dr) + SOFTENING**2
-        dist = np.sqrt(dist2)
-
-        if self.is_leaf:
-            if self.idx >= 0 and np.allclose(particle_pos[self.idx], pos):
-                return np.zeros(3)  # 自己相互作用を除外
-            return G * self.mass * dr / (dist2 * dist)
-
-        # 開き角判定: s/d < theta なら質量中心近似を使う
-        s = 2 * self.half
-        if s / dist < theta:
-            return G * self.mass * dr / (dist2 * dist)
-
-        # 精度不足 → 子ノードへ再帰
-        acc = np.zeros(3)
-        for child in self.children:
-            if child is not None:
-                acc += child.calc_acc(pos, theta, particle_pos, particle_mass)
-        return acc
+# child octant offset table: shape (8, 3), values in {-1, +1}
+_OI = np.arange(8)
+_OFFSETS = np.stack([
+    (_OI >> 2 & 1) * 2 - 1,
+    (_OI >> 1 & 1) * 2 - 1,
+    (_OI      & 1) * 2 - 1,
+], axis=1).astype(np.float64)  # (8, 3)
 
 
-def _build_tree(p: Particles) -> OctreeNode:
-    """粒子群から八分木を構築"""
-    # ルートノードのサイズを粒子の最大範囲に合わせる
-    center = (p.pos.max(axis=0) + p.pos.min(axis=0)) / 2
-    half   = (p.pos.max(axis=0) - p.pos.min(axis=0)).max() / 2 * 1.01 + 1e-8
+def _build_flat_octree(pos: np.ndarray, mass: np.ndarray):
+    """
+    八分木をフラット配列として構築する（BFS）。
 
-    root = OctreeNode(center, half)
+    Returns
+    -------
+    com        : (M, 3)  各ノードの質量中心
+    node_mass  : (M,)    各ノードの総質量
+    node_half  : (M,)    各ノードの半辺長
+    children   : (M, 8)  子ノードインデックス（存在しない場合は -1）
+    leaf_idx   : (M,)    葉ノードの粒子インデックス（内部ノードは -1）
+    """
+    N = len(mass)
+    max_nodes = max(4 * N, 64)
 
-    # 簡略実装: 全粒子を順番に挿入
-    # (既存粒子の位置保持が必要なため、シンプルに全粒子ループで insert)
-    # ここでは内部ノード化時の再挿入問題を回避するため、
-    # 葉の分割を実装したフルバージョンを使う
-    root2 = _FullOctree(center, half, p.pos, p.mass)
-    return root2
+    com       = np.zeros((max_nodes, 3))
+    node_mass = np.zeros(max_nodes)
+    node_half = np.zeros(max_nodes)
+    node_ctr  = np.zeros((max_nodes, 3))
+    children  = np.full((max_nodes, 8), -1, dtype=np.int32)
+    leaf_idx  = np.full(max_nodes, -1, dtype=np.int32)
 
+    root_ctr  = (pos.max(axis=0) + pos.min(axis=0)) * 0.5
+    root_half = (pos.max(axis=0) - pos.min(axis=0)).max() * 0.5 * 1.01 + 1e-8
+    node_ctr[0]  = root_ctr
+    node_half[0] = root_half
+    n = 1
 
-class _FullOctree:
-    """シンプルかつ正確な八分木実装（粒子配列を直接保持）"""
+    queue = deque([(0, np.arange(N, dtype=np.int32))])
 
-    def __init__(self, center, half, pos, mass):
-        self.center = center
-        self.half   = half
-        self.pos    = pos
-        self.mass   = mass
-        self.total_mass = mass.sum()
-        self.com = (pos * mass[:, None]).sum(axis=0) / self.total_mass
-        self.children  = [None] * 8
-        self.leaf_idx  = None
+    while queue:
+        ni, idx = queue.popleft()
+        sub_pos  = pos[idx]
+        sub_mass = mass[idx]
 
-        indices = np.arange(len(mass))
-        self._build(indices)
+        tm = sub_mass.sum()
+        node_mass[ni] = tm
+        com[ni] = (sub_pos * sub_mass[:, None]).sum(axis=0) / tm
 
-    def _octant(self, p):
-        bit = (p > self.center).astype(int)
-        return bit[0] * 4 + bit[1] * 2 + bit[2]
+        if len(idx) == 1:
+            leaf_idx[ni] = idx[0]
+            continue
 
-    def _child_center(self, oi):
-        q = self.half / 2
-        offsets = np.array([
-            ((oi >> 2) & 1) * 2 - 1,
-            ((oi >> 1) & 1) * 2 - 1,
-            ((oi >> 0) & 1) * 2 - 1,
-        ], dtype=float)
-        return self.center + offsets * q
+        c = node_ctr[ni]
+        q = node_half[ni] * 0.5
 
-    def _build(self, indices):
-        if len(indices) == 1:
-            self.leaf_idx = indices[0]
-            return
-        # 各粒子をどの八分体に割り当てるか
-        octants = np.array([self._octant(self.pos[i]) for i in indices])
+        # 全粒子のオクタントをベクトル化で一括計算
+        bits    = (sub_pos > c).astype(np.int32)           # (K, 3)
+        octants = bits[:, 0] * 4 + bits[:, 1] * 2 + bits[:, 2]  # (K,)
+        child_ctrs = c + _OFFSETS * q                      # (8, 3)
+
         for oi in range(8):
-            sub = indices[octants == oi]
-            if len(sub) == 0:
+            mask = octants == oi
+            if not mask.any():
                 continue
-            child = _FullOctree.__new__(_FullOctree)
-            child.center = self._child_center(oi)
-            child.half   = self.half / 2
-            child.pos    = self.pos
-            child.mass   = self.mass
-            child.children = [None] * 8
-            child.leaf_idx = None
-            sub_mass = self.mass[sub]
-            child.total_mass = sub_mass.sum()
-            child.com = (self.pos[sub] * sub_mass[:, None]).sum(axis=0) / child.total_mass
-            child._build(sub)
-            self.children[oi] = child
+            if n >= max_nodes:
+                extra = max_nodes
+                com       = np.vstack([com,      np.zeros((extra, 3))])
+                node_mass = np.concatenate([node_mass, np.zeros(extra)])
+                node_half = np.concatenate([node_half, np.zeros(extra)])
+                node_ctr  = np.vstack([node_ctr, np.zeros((extra, 3))])
+                children  = np.vstack([children, np.full((extra, 8), -1, dtype=np.int32)])
+                leaf_idx  = np.concatenate([leaf_idx, np.full(extra, -1, dtype=np.int32)])
+                max_nodes *= 2
+            ci = n; n += 1
+            node_ctr[ci]  = child_ctrs[oi]
+            node_half[ci] = q
+            children[ni, oi] = ci
+            queue.append((ci, idx[mask]))
 
-    def calc_acc(self, pos, theta, src_idx=None):
-        if self.total_mass == 0.0:
-            return np.zeros(3)
-        dr = self.com - pos
-        dist2 = np.dot(dr, dr) + SOFTENING**2
-        dist  = np.sqrt(dist2)
-
-        if self.leaf_idx is not None:
-            if self.leaf_idx == src_idx:
-                return np.zeros(3)
-            return G * self.total_mass * dr / (dist2 * dist)
-
-        s = 2 * self.half
-        if s / dist < theta:
-            return G * self.total_mass * dr / (dist2 * dist)
-
-        acc = np.zeros(3)
-        for child in self.children:
-            if child is not None:
-                acc += child.calc_acc(pos, theta, src_idx)
-        return acc
+    return com[:n], node_mass[:n], node_half[:n], children[:n], leaf_idx[:n]
 
 
 def compute_acceleration_barneshut(p: Particles, theta: float = 0.5) -> np.ndarray:
     """
     Barnes-Hut法で全粒子の加速度を計算。
 
+    ベクトル化BFS: 全 (粒子, ノード) ペアを一括処理し、
+    - 開き角基準を満たすペア → 質量中心近似で力を計算
+    - 満たさないペア → 子ノードへ展開
+    Python ループは木の深さ O(log N) 回のみ。
+
     Parameters
     ----------
     theta : float
-        開き角パラメータ (0=直接法と同等, 1.0=粗い近似)
+        開き角パラメータ（小さいほど精度高・速度低）
     """
-    tree = _build_tree(p)
-    acc  = np.zeros((p.N, 3))
-    for i in range(p.N):
-        acc[i] = tree.calc_acc(p.pos[i], theta, src_idx=i)
+    com, node_mass, node_half, node_children, node_leaf_idx = \
+        _build_flat_octree(p.pos, p.mass)
+
+    N   = p.N
+    acc = np.zeros((N, 3))
+
+    # 全粒子がルート（ノード0）からスタート
+    act_par = np.arange(N, dtype=np.int32)
+    act_nod = np.zeros(N, dtype=np.int32)
+
+    while len(act_par) > 0:
+        nod_com  = com[act_nod]                       # (K, 3)
+        nod_mass = node_mass[act_nod]                 # (K,)
+        nod_half = node_half[act_nod]                 # (K,)
+        leaf_par = node_leaf_idx[act_nod]             # (K,)  -1 if internal
+        is_leaf  = leaf_par >= 0                      # (K,)
+
+        dr    = nod_com - p.pos[act_par]              # (K, 3)
+        dist2 = np.einsum('ij,ij->i', dr, dr) + SOFTENING**2  # (K,)
+        dist  = np.sqrt(dist2)                        # (K,)
+
+        is_self    = is_leaf & (leaf_par == act_par)
+        open_angle = (2.0 * nod_half) / dist          # s/d
+        use_approx = ((open_angle < theta) | is_leaf) & ~is_self
+
+        # 力を蓄積（COM近似 or 葉ノード）
+        if use_approx.any():
+            ap = act_par[use_approx]
+            m_ = nod_mass[use_approx]
+            dp = dr[use_approx]
+            d2 = dist2[use_approx]
+            d  = dist[use_approx]
+
+            f = G * m_[:, None] * dp / (d2 * d)[:, None]  # (K', 3)
+
+            # bincount による高速 scatter-add（np.add.at より速い）
+            for dim in range(3):
+                acc[:, dim] += np.bincount(ap, weights=f[:, dim], minlength=N)
+
+        # 子ノードへ展開（再帰が必要なペアのみ）
+        recurse = ~use_approx & ~is_self
+        if not recurse.any():
+            break
+
+        rec_par    = act_par[recurse]
+        rec_nod    = act_nod[recurse]
+        child_nods = node_children[rec_nod]   # (K_rec, 8)
+        valid      = child_nods >= 0          # (K_rec, 8)
+
+        act_par = np.repeat(rec_par, 8)[valid.ravel()]
+        act_nod = child_nods.ravel()[valid.ravel()].astype(np.int32)
+
     return acc

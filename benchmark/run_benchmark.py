@@ -90,25 +90,19 @@ def run_single_benchmark(N: int = 200, n_trials: int = 3):
             "label": f"FMM (cells={nc}³)",
         }
 
-    # --- グラフ圧縮法（3手法 × 複数 keep_ratio）---
-    for method, short, label_prefix in [
-        ("threshold",  "gc",      "閾値圧縮"),
-        ("importance", "gc_imp",  "重み比例サンプリング"),
-        ("spectral",   "gc_spec", "スペクトルスパース化"),
-    ]:
-        for kr in [0.3, 0.5, 0.7, 1.0]:
-            times = []
-            acc_gc = None
-            for _ in range(n_trials):
-                t0 = time.perf_counter()
-                acc_gc, _, _ = compute_acceleration_graph(p, keep_ratio=kr, method=method)
-                times.append(time.perf_counter() - t0)
-            results[f"{short}_k{kr}"] = {
-                "time": np.median(times),
-                "error": relative_error(acc_direct, acc_gc),
-                "label": f"{label_prefix} {int(kr*100)}%",
-                "method": method,
-            }
+    # --- スペクトルスパース化（複数 keep_ratio）---
+    for kr in [0.3, 0.5, 0.7, 1.0]:
+        times = []
+        acc_gc = None
+        for _ in range(n_trials):
+            t0 = time.perf_counter()
+            acc_gc, _, _ = compute_acceleration_graph(p, keep_ratio=kr)
+            times.append(time.perf_counter() - t0)
+        results[f"gc_spec_k{kr}"] = {
+            "time": np.median(times),
+            "error": relative_error(acc_direct, acc_gc),
+            "label": f"スペクトル {int(kr*100)}%",
+        }
 
     return results
 
@@ -119,47 +113,41 @@ def run_single_benchmark(N: int = 200, n_trials: int = 3):
 
 def run_scaling_benchmark(N_list=None):
     if N_list is None:
-        N_list = [50, 100, 200, 300, 500, 800]
+        N_list = [50, 100, 200, 300, 500, 700, 1000]
 
-    times_direct = []
-    times_bh     = []
-    times_fmm    = []
-    times_gc     = []
+    times_direct  = []
+    times_bh      = []
+    times_fmm     = []
+    times_gc_spec = []
 
     for N in N_list:
         p = make_random_particles(N)
         print(f"  N={N}...", end="", flush=True)
 
-        t0 = time.perf_counter(); compute_acceleration_direct(p);      times_direct.append(time.perf_counter() - t0)
-        t0 = time.perf_counter(); compute_acceleration_barneshut(p);   times_bh.append(time.perf_counter() - t0)
-        t0 = time.perf_counter(); compute_acceleration_fmm(p);         times_fmm.append(time.perf_counter() - t0)
-        t0 = time.perf_counter(); compute_acceleration_graph(p, 0.5);  times_gc.append(time.perf_counter() - t0)
+        t0 = time.perf_counter(); compute_acceleration_direct(p);          times_direct.append(time.perf_counter() - t0)
+        t0 = time.perf_counter(); compute_acceleration_barneshut(p);       times_bh.append(time.perf_counter() - t0)
+        t0 = time.perf_counter(); compute_acceleration_fmm(p);             times_fmm.append(time.perf_counter() - t0)
+        t0 = time.perf_counter(); compute_acceleration_graph(p, 0.5);      times_gc_spec.append(time.perf_counter() - t0)
+
         print(" done")
 
-    return N_list, times_direct, times_bh, times_fmm, times_gc
+    return N_list, times_direct, times_bh, times_fmm, times_gc_spec
 
 
 # ─────────────────────────────────────────────────────
 # 4. プロット
 # ─────────────────────────────────────────────────────
 
-def plot_results(single_results, scaling_data, out_path="benchmark_results.png"):
-    fig = plt.figure(figsize=(14, 10))
+def plot_results(single_results, scaling_data, out_path="benchmark_results.png", N_single=200):
+    fig = plt.figure(figsize=(14, 15))
     fig.patch.set_facecolor("#f8f8f6")
-    gs  = gridspec.GridSpec(2, 2, figure=fig, hspace=0.45, wspace=0.35)
+    gs  = gridspec.GridSpec(3, 2, figure=fig, hspace=0.50, wspace=0.35)
 
     colors = {
         "direct":  "#444441",
         "bh":      "#534AB7",
         "fmm":     "#0F6E56",
-        "gc":      "#993C1D",    # 閾値圧縮
-        "gc_imp":  "#D4621A",    # 重み比例サンプリング
-        "gc_spec": "#6B1F0A",    # スペクトルスパース化
-    }
-    gc_methods = {
-        "gc":      ("threshold",  "閾値圧縮",          "^",  colors["gc"]),
-        "gc_imp":  ("importance", "重み比例",          "D",  colors["gc_imp"]),
-        "gc_spec": ("spectral",   "スペクトル",        "P",  colors["gc_spec"]),
+        "gc_spec": "#6B1F0A",
     }
 
     # ── (A) 精度 vs 速度（散布図）──
@@ -174,12 +162,8 @@ def plot_results(single_results, scaling_data, out_path="benchmark_results.png")
             c, mk = colors["bh"], "o"
         elif key.startswith("fmm"):
             c, mk = colors["fmm"], "s"
-        elif key.startswith("gc_spec"):
-            c, mk = colors["gc_spec"], "P"
-        elif key.startswith("gc_imp"):
-            c, mk = colors["gc_imp"], "D"
         else:
-            c, mk = colors["gc"], "^"
+            c, mk = colors["gc_spec"], "P"
         ax1.scatter(res["error"], res["time"] * 1000,
                     color=c, marker=mk, s=90, zorder=3)
         ax1.annotate(res["label"], (res["error"], res["time"] * 1000),
@@ -196,34 +180,64 @@ def plot_results(single_results, scaling_data, out_path="benchmark_results.png")
     ax1.grid(True, alpha=0.3)
 
     # ── (B) Nスケーリング ──
-    N_list, td, tbh, tfmm, tgc = scaling_data
+    N_list, td, tbh, tfmm, tgc_spec = scaling_data
+    ns = np.array(N_list)
+
     ax2 = fig.add_subplot(gs[1, 0])
     ax2.set_facecolor("#f8f8f6")
     ax2.set_title("計算時間 vs N", fontsize=12, fontweight="500")
-    ax2.plot(N_list, [t*1000 for t in td],  "o-", color=colors["direct"], label="直接法 O(N²)",       linewidth=1.5)
-    ax2.plot(N_list, [t*1000 for t in tbh], "s-", color=colors["bh"],     label="Barnes-Hut",        linewidth=1.5)
-    ax2.plot(N_list, [t*1000 for t in tfmm],"^-", color=colors["fmm"],    label="FMM",               linewidth=1.5)
-    ax2.plot(N_list, [t*1000 for t in tgc], "D-", color=colors["gc"],     label="閾値圧縮 (50%)",    linewidth=1.5)
+    ax2.plot(ns, [t*1000 for t in td],       "o-", color=colors["direct"],  label="直接法 O(N2)",      linewidth=1.5)
+    ax2.plot(ns, [t*1000 for t in tbh],      "s-", color=colors["bh"],      label="Barnes-Hut",        linewidth=1.5)
+    ax2.plot(ns, [t*1000 for t in tfmm],     "^-", color=colors["fmm"],     label="FMM",               linewidth=1.5)
+    ax2.plot(ns, [t*1000 for t in tgc_spec], "P-", color=colors["gc_spec"], label="スペクトル k=32",   linewidth=1.5)
     ax2.set_xlabel("N (粒子数)", fontsize=10)
     ax2.set_ylabel("計算時間 [ms]", fontsize=10)
+    ax2.set_xscale("log")
     ax2.legend(fontsize=8)
     ax2.grid(True, alpha=0.3)
 
-    # ── (C) グラフ圧縮 3手法: 保持率 vs 誤差 ──
+    # ── (C) スペクトル: 保持率 vs 誤差 ──
     ax3 = fig.add_subplot(gs[1, 1])
     ax3.set_facecolor("#f8f8f6")
-    ax3.set_title("グラフ圧縮 3手法: 保持率 vs 誤差", fontsize=12, fontweight="500")
+    ax3.set_title("スペクトルスパース化: 保持率 vs 誤差", fontsize=12, fontweight="500")
     krs_base = [0.3, 0.5, 0.7, 1.0]
-    for prefix, (_, label, mk, c) in gc_methods.items():
-        keys = [f"{prefix}_k{kr}" for kr in krs_base]
-        errs = [single_results[k]["error"] for k in keys if k in single_results]
-        krs_plot = [kr for kr in krs_base if f"{prefix}_k{kr}" in single_results]
-        ax3.plot(krs_plot, errs, f"{mk}-", color=c, label=label, linewidth=1.5)
+    errs = [single_results[f"gc_spec_k{kr}"]["error"] for kr in krs_base if f"gc_spec_k{kr}" in single_results]
+    krs_plot = [kr for kr in krs_base if f"gc_spec_k{kr}" in single_results]
+    ax3.plot(krs_plot, errs, "P-", color=colors["gc_spec"], linewidth=1.5)
     ax3.set_xlabel("保持率 (keep_ratio)", fontsize=10)
     ax3.set_ylabel("相対誤差 (RMS)", fontsize=10)
     ax3.set_yscale("log")
-    ax3.legend(fontsize=8)
     ax3.grid(True, alpha=0.3)
+
+    # ── (D) 粒子分布（XY / XZ 射影）──
+    p_vis = make_random_particles(N_single)
+    vmin, vmax = p_vis.mass.min(), p_vis.mass.max()
+    cmap = "plasma"
+    s = (p_vis.mass - vmin) / (vmax - vmin) * 40 + 10   # 10〜50px
+
+    ax4 = fig.add_subplot(gs[2, 0])
+    ax4.set_facecolor("#f8f8f6")
+    ax4.set_title(f"粒子分布 XY (N={N_single})", fontsize=12, fontweight="500")
+    sc4 = ax4.scatter(p_vis.pos[:, 0], p_vis.pos[:, 1],
+                      c=p_vis.mass, cmap=cmap, vmin=vmin, vmax=vmax,
+                      s=s, alpha=0.75, linewidths=0)
+    fig.colorbar(sc4, ax=ax4, label="質量 [Msun]", shrink=0.85)
+    ax4.set_xlabel("X [AU]", fontsize=10)
+    ax4.set_ylabel("Y [AU]", fontsize=10)
+    ax4.set_aspect("equal", adjustable="datalim")
+    ax4.grid(True, alpha=0.3)
+
+    ax5 = fig.add_subplot(gs[2, 1])
+    ax5.set_facecolor("#f8f8f6")
+    ax5.set_title(f"粒子分布 XZ (N={N_single})", fontsize=12, fontweight="500")
+    sc5 = ax5.scatter(p_vis.pos[:, 0], p_vis.pos[:, 2],
+                      c=p_vis.mass, cmap=cmap, vmin=vmin, vmax=vmax,
+                      s=s, alpha=0.75, linewidths=0)
+    fig.colorbar(sc5, ax=ax5, label="質量 [Msun]", shrink=0.85)
+    ax5.set_xlabel("X [AU]", fontsize=10)
+    ax5.set_ylabel("Z [AU]", fontsize=10)
+    ax5.set_aspect("equal", adjustable="datalim")
+    ax5.grid(True, alpha=0.3)
 
     plt.savefig(out_path, dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
     print(f"\n図を保存: {out_path}")
@@ -250,7 +264,7 @@ if __name__ == "__main__":
         print(f"{res['label']:<30} {res['time']*1000:>10.2f} {err_str:>12}")
 
     print("\n[2/2] スケーリング比較...")
-    scaling = run_scaling_benchmark([50, 100, 200, 300, 500])
+    scaling = run_scaling_benchmark()
 
     out = str(Path(__file__).parent.parent / "benchmark_results.png")
     plot_results(single, scaling, out_path=out)
