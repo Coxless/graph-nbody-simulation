@@ -1,5 +1,5 @@
 """
-ベンチマーク — 直接法 / Barnes-Hut / FMM / グラフ圧縮法の比較
+ベンチマーク — 直接法 / Barnes-Hut / グラフ圧縮法の比較
 """
 
 import time
@@ -23,10 +23,9 @@ for _fp in _jp_font_candidates:
         plt.rcParams["font.family"] = fm.FontProperties(fname=str(_fp)).get_name()
         break
 
-from nbody_graph.utils.core import make_random_particles, G, SOFTENING
+from nbody_graph.utils.core import make_random_particles, make_clustered_particles, G, SOFTENING
 from nbody_graph.methods.direct          import compute_acceleration_direct
 from nbody_graph.methods.barnes_hut      import compute_acceleration_barneshut
-from nbody_graph.methods.fmm             import compute_acceleration_fmm
 from nbody_graph.methods.graph_compression import compute_acceleration_graph
 
 
@@ -48,7 +47,7 @@ def relative_error(acc_ref: np.ndarray, acc_approx: np.ndarray) -> float:
 # ─────────────────────────────────────────────────────
 
 def run_single_benchmark(N: int = 200, n_trials: int = 3):
-    p = make_random_particles(N)
+    p = make_clustered_particles(N)
 
     results = {}
 
@@ -77,19 +76,6 @@ def run_single_benchmark(N: int = 200, n_trials: int = 3):
             "label": f"Barnes-Hut θ={theta}",
         }
 
-    # --- FMM ---
-    for nc in [2, 3, 4]:
-        times = []
-        for _ in range(n_trials):
-            t0 = time.perf_counter()
-            acc_fmm = compute_acceleration_fmm(p, n_cells_per_dim=nc)
-            times.append(time.perf_counter() - t0)
-        results[f"fmm_c{nc}"] = {
-            "time": np.median(times),
-            "error": relative_error(acc_direct, acc_fmm),
-            "label": f"FMM (cells={nc}³)",
-        }
-
     # --- スペクトルスパース化（複数 keep_ratio）---
     for kr in [0.3, 0.5, 0.7, 1.0]:
         times = []
@@ -113,25 +99,23 @@ def run_single_benchmark(N: int = 200, n_trials: int = 3):
 
 def run_scaling_benchmark(N_list=None):
     if N_list is None:
-        N_list = [50, 100, 200, 300, 500, 700, 1000]
+        N_list = [100, 200, 500, 1000, 2000, 3000, 5000, 10000]
 
     times_direct  = []
     times_bh      = []
-    times_fmm     = []
     times_gc_spec = []
 
     for N in N_list:
-        p = make_random_particles(N)
+        p = make_clustered_particles(N)
         print(f"  N={N}...", end="", flush=True)
 
         t0 = time.perf_counter(); compute_acceleration_direct(p);          times_direct.append(time.perf_counter() - t0)
         t0 = time.perf_counter(); compute_acceleration_barneshut(p);       times_bh.append(time.perf_counter() - t0)
-        t0 = time.perf_counter(); compute_acceleration_fmm(p);             times_fmm.append(time.perf_counter() - t0)
         t0 = time.perf_counter(); compute_acceleration_graph(p, 0.5);      times_gc_spec.append(time.perf_counter() - t0)
 
         print(" done")
 
-    return N_list, times_direct, times_bh, times_fmm, times_gc_spec
+    return N_list, times_direct, times_bh, times_gc_spec
 
 
 # ─────────────────────────────────────────────────────
@@ -146,7 +130,6 @@ def plot_results(single_results, scaling_data, out_path="benchmark_results.png",
     colors = {
         "direct":  "#444441",
         "bh":      "#534AB7",
-        "fmm":     "#0F6E56",
         "gc_spec": "#6B1F0A",
     }
 
@@ -160,8 +143,6 @@ def plot_results(single_results, scaling_data, out_path="benchmark_results.png",
             continue
         if key.startswith("bh"):
             c, mk = colors["bh"], "o"
-        elif key.startswith("fmm"):
-            c, mk = colors["fmm"], "s"
         else:
             c, mk = colors["gc_spec"], "P"
         ax1.scatter(res["error"], res["time"] * 1000,
@@ -180,7 +161,7 @@ def plot_results(single_results, scaling_data, out_path="benchmark_results.png",
     ax1.grid(True, alpha=0.3)
 
     # ── (B) Nスケーリング ──
-    N_list, td, tbh, tfmm, tgc_spec = scaling_data
+    N_list, td, tbh, tgc_spec = scaling_data
     ns = np.array(N_list)
 
     ax2 = fig.add_subplot(gs[1, 0])
@@ -188,11 +169,11 @@ def plot_results(single_results, scaling_data, out_path="benchmark_results.png",
     ax2.set_title("計算時間 vs N", fontsize=12, fontweight="500")
     ax2.plot(ns, [t*1000 for t in td],       "o-", color=colors["direct"],  label="直接法 O(N2)",      linewidth=1.5)
     ax2.plot(ns, [t*1000 for t in tbh],      "s-", color=colors["bh"],      label="Barnes-Hut",        linewidth=1.5)
-    ax2.plot(ns, [t*1000 for t in tfmm],     "^-", color=colors["fmm"],     label="FMM",               linewidth=1.5)
     ax2.plot(ns, [t*1000 for t in tgc_spec], "P-", color=colors["gc_spec"], label="スペクトル k=32",   linewidth=1.5)
     ax2.set_xlabel("N (粒子数)", fontsize=10)
     ax2.set_ylabel("計算時間 [ms]", fontsize=10)
     ax2.set_xscale("log")
+    ax2.set_yscale("log")
     ax2.legend(fontsize=8)
     ax2.grid(True, alpha=0.3)
 
@@ -210,14 +191,14 @@ def plot_results(single_results, scaling_data, out_path="benchmark_results.png",
     ax3.grid(True, alpha=0.3)
 
     # ── (D) 粒子分布（XY / XZ 射影）──
-    p_vis = make_random_particles(N_single)
+    p_vis = make_clustered_particles(N_single)
     vmin, vmax = p_vis.mass.min(), p_vis.mass.max()
     cmap = "plasma"
     s = (p_vis.mass - vmin) / (vmax - vmin) * 40 + 10   # 10〜50px
 
     ax4 = fig.add_subplot(gs[2, 0])
     ax4.set_facecolor("#f8f8f6")
-    ax4.set_title(f"粒子分布 XY (N={N_single})", fontsize=12, fontweight="500")
+    ax4.set_title(f"粒子分布 XY — クラスター分布 (N={N_single})", fontsize=12, fontweight="500")
     sc4 = ax4.scatter(p_vis.pos[:, 0], p_vis.pos[:, 1],
                       c=p_vis.mass, cmap=cmap, vmin=vmin, vmax=vmax,
                       s=s, alpha=0.75, linewidths=0)
@@ -229,7 +210,7 @@ def plot_results(single_results, scaling_data, out_path="benchmark_results.png",
 
     ax5 = fig.add_subplot(gs[2, 1])
     ax5.set_facecolor("#f8f8f6")
-    ax5.set_title(f"粒子分布 XZ (N={N_single})", fontsize=12, fontweight="500")
+    ax5.set_title(f"粒子分布 XZ — クラスター分布 (N={N_single})", fontsize=12, fontweight="500")
     sc5 = ax5.scatter(p_vis.pos[:, 0], p_vis.pos[:, 2],
                       c=p_vis.mass, cmap=cmap, vmin=vmin, vmax=vmax,
                       s=s, alpha=0.75, linewidths=0)

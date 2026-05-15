@@ -5,11 +5,11 @@
   scipy.spatial.KDTree で k 近傍のみエッジ化 → O(N log N + N·k)
 
 圧縮アルゴリズム:
-  スペクトルスパース化（Spielman-Srivastava 型）— 有効抵抗ベースのサンプリング
+  次数ベースレバレッジスコア近似 — R_e ≈ 1/deg[i] + 1/deg[j]
+  k-NN グラフで有効な局所近似。O(E) で全 N スケールに対応。
 """
 
 import numpy as np
-from scipy.linalg import eigh
 from scipy.spatial import KDTree
 from ..utils.core import Particles, G, SOFTENING
 
@@ -60,18 +60,11 @@ def build_sparse_interaction_graph(p: Particles, k_neighbors: int = 32):
 
 def compress_graph_spectral(ii, jj, weights, keep_ratio: float = 0.5, seed=None):
     """
-    有効抵抗に基づくスペクトルスパース化。
+    次数ベースレバレッジスコアによるグラフスパース化。
 
-    重み付きラプラシアン L = D − A の固有分解から有効抵抗
-        R_e = (e_i − e_j)ᵀ L⁺ (e_i − e_j)
-    を計算し、レバレッジスコア l_e = w_e · R_e に比例する確率でサンプリング。
-
-    性質:
-    - Σ l_e = n−1（連結グラフ）— 接続に不可欠なエッジほど高スコア
-    - keep_ratio = (n−1)/E のとき、スパニングツリー構造が必ず残る
-    - 採択後の重みスケーリングで不偏推定を維持
-
-    計算コスト: O(N³)（密行列の固有分解）。スパースグラフ後でも N が律速。
+    R_e ≈ 1/deg[i] + 1/deg[j] を有効抵抗の近似として使用。
+    k-NN グラフで孤立粒子（低次数）を優先保持する物理的に妥当な近似。
+    O(E) で全 N スケールに対応。
     """
     if len(weights) == 0 or keep_ratio >= 1.0:
         return ii, jj, weights.copy()
@@ -79,32 +72,15 @@ def compress_graph_spectral(ii, jj, weights, keep_ratio: float = 0.5, seed=None)
     N = int(max(ii.max(), jj.max())) + 1
     n_keep = max(1, int(len(weights) * keep_ratio))
 
-    # 重み付きラプラシアン L = D − A（密行列）
     deg = np.zeros(N)
     np.add.at(deg, ii, weights)
     np.add.at(deg, jj, weights)
-    L = np.diag(deg)
-    L[ii, jj] -= weights
-    L[jj, ii] -= weights
 
-    # 固有分解 L = U Λ Uᵀ
-    eigvals, U = eigh(L)
-    tol = eigvals[-1] * 1e-10
-    nonzero = eigvals > tol
-
-    # V[i, :] ≡ (Λ^{1/2+} Uᵀ)[:, i]  →  R_ij = ‖V[i] − V[j]‖²
-    sqrt_inv = np.where(nonzero, 1.0 / np.sqrt(np.maximum(eigvals, tol)), 0.0)
-    V = U * sqrt_inv[None, :]
-
-    diff_V = V[ii] - V[jj]
-    R = np.sum(diff_V**2, axis=1)
-
+    R = 1.0 / np.maximum(deg[ii], 1e-30) + 1.0 / np.maximum(deg[jj], 1e-30)
     leverage = weights * R
     l_sum = leverage.sum()
     if l_sum < 1e-30:
-        # レバレッジスコアが縮退した場合は一様サンプリングにフォールバック
-        rng2 = np.random.default_rng(seed)
-        idx = rng2.choice(len(weights), size=n_keep, replace=False)
+        idx = rng.choice(len(weights), size=n_keep, replace=False)
         mask = np.zeros(len(weights), dtype=bool)
         mask[idx] = True
         return ii[mask], jj[mask], weights[mask]
